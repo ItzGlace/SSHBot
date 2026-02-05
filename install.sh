@@ -32,7 +32,7 @@ read -rp "$(echo -e ${YELLOW}'🤖 Enter Telegram Bot Token: '${RESET})" BOT_TOK
 INSTALL_DIR="/opt/sshbot"
 BOT_FILE="$INSTALL_DIR/ssh-bot.py"
 VENV_DIR="$INSTALL_DIR/venv"
-SERVICE_FILE="/etc/systemd/system/sshbot.service"
+SERVICE_FILE="/etc/systemd/system/ssh-bot.service"
 
 # ================= OS / PACKAGE MANAGER =================
 msg "Detecting Linux distribution"
