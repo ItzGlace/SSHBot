@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""
+SSH Telegram bot — terminal SSH access over telergam
+
+Developed by:
+ - t.me/ItzGlace
+ - GitHub.com/ItzGlace
+
+"""
+
 import os
 import sys
 import time
@@ -6,16 +15,18 @@ import threading
 import logging
 import logging.handlers
 import re
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 
 import paramiko
 import pyte
 
 from telegram import (
     Update,
+    ParseMode,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ParseMode,
 )
 from telegram.ext import (
     Updater,
@@ -25,6 +36,10 @@ from telegram.ext import (
     CallbackQueryHandler,
     CallbackContext,
 )
+
+import hashlib
+import inspect
+import urllib.request
 
 # ================= CONFIG =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -37,16 +52,24 @@ LOG_DIR = "/var/log/ssh-bot"
 LOG_FILE = f"{LOG_DIR}/ssh-bot.log"
 
 REPO_URL = "https://github.com/ItzGlace/SSHBot"
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/ItzGlace/SSHBot/refs/heads/main/ssh-bot.py"
 
 # ================= LOGGING =================
-os.makedirs(LOG_DIR, exist_ok=True)
+try:
+    os.makedirs(LOG_DIR, exist_ok=True)
+except Exception:
+    pass
+
 logger = logging.getLogger("ssh-bot")
 logger.setLevel(logging.INFO)
 
 fmt = logging.Formatter("[%(asctime)s] %(levelname)s - %(message)s")
-fh = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3)
-fh.setFormatter(fmt)
-logger.addHandler(fh)
+try:
+    fh = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+except Exception:
+    pass
 
 sh = logging.StreamHandler(sys.stdout)
 sh.setFormatter(fmt)
@@ -54,10 +77,11 @@ logger.addHandler(sh)
 
 # ================= STATE =================
 SESSIONS: Dict[int, "SSHSession"] = {}
-PENDING: Dict[int, Tuple[str, str, int]] = {}
+PENDING: Dict[int, Tuple[str, str, int, float]] = {}  # (user, host, port, timestamp)
 
 SSH_RE = re.compile(r"([^@]+)@([^:]+)(?::(\d+))?$")
 
+# core sequences (extended)
 KEYS = {
     "TAB": "\t",
     "ENTER": "\r",
@@ -70,7 +94,82 @@ KEYS = {
     "PGUP": "\x1b[5~",
     "PGDN": "\x1b[6~",
     "NANO_EXIT": "\x18",  # CTRL+X
+
+    # extended keys
+    "INSERT": "\x1b[2~",
+    "DELETE": "\x1b[3~",
+    "HOME": "\x1b[1~",
+    "END": "\x1b[4~",
+    "SHIFTTAB": "\x1b[Z",
+
+    # function keys (common sequences)
+    "F1": "\x1bOP",
+    "F2": "\x1bOQ",
+    "F3": "\x1bOR",
+    "F4": "\x1bOS",
+    "F5": "\x1b[15~",
+    "F6": "\x1b[17~",
+    "F7": "\x1b[18~",
+    "F8": "\x1b[19~",
+    "F9": "\x1b[20~",
+    "F10": "\x1b[21~",
+    "F11": "\x1b[23~",
+    "F12": "\x1b[24~",
 }
+
+# visible cursor char overlay
+CURSOR_CHAR = "▒"
+
+# Reply keyboard layout (native) — includes extended keys
+REPLY_KEYBOARD = [
+    ["TAB", "ENTER", "ESC", "BS"],
+    ["↑", "↓", "←", "→"],
+    ["PGUP", "PGDN", "SHIFTTAB"],
+    ["INSERT", "DELETE", "HOME", "END"],
+    ["F1", "F2", "F3", "F4"],
+    ["F5", "F6", "F7", "F8"],
+    ["F9", "F10", "F11", "F12"],
+    ["EXIT NANO (Ctrl+X)"],
+]
+
+# helper mapping from label to sequence (for reply keyboard)
+LABEL_TO_SEQ = {
+    "TAB": KEYS["TAB"],
+    "ENTER": KEYS["ENTER"],
+    "ESC": KEYS["ESC"],
+    "BS": KEYS["BS"],
+    "↑": KEYS["UP"],
+    "↓": KEYS["DOWN"],
+    "←": KEYS["LEFT"],
+    "→": KEYS["RIGHT"],
+    "PGUP": KEYS["PGUP"],
+    "PGDN": KEYS["PGDN"],
+    "EXIT NANO (Ctrl+X)": KEYS["NANO_EXIT"],
+
+    # extended
+    "INSERT": KEYS["INSERT"],
+    "DELETE": KEYS["DELETE"],
+    "HOME": KEYS["HOME"],
+    "END": KEYS["END"],
+    "SHIFTTAB": KEYS["SHIFTTAB"],
+    "F1": KEYS["F1"],
+    "F2": KEYS["F2"],
+    "F3": KEYS["F3"],
+    "F4": KEYS["F4"],
+    "F5": KEYS["F5"],
+    "F6": KEYS["F6"],
+    "F7": KEYS["F7"],
+    "F8": KEYS["F8"],
+    "F9": KEYS["F9"],
+    "F10": KEYS["F10"],
+    "F11": KEYS["F11"],
+    "F12": KEYS["F12"],
+}
+
+# Inline keyboard for the console message: only Close connection (glass)
+INLINE_CLOSE_KB = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("Close connection", callback_data="C:CLOSE")]]
+)
 
 # ================= SSH SESSION =================
 class SSHSession:
@@ -78,17 +177,23 @@ class SSHSession:
         self.chat_id = chat_id
         self.bot = bot
 
-        self.client = None
+        self.client: Optional[paramiko.SSHClient] = None
         self.chan = None
         self.stop = threading.Event()
-        self.thread = None
+        self.thread: Optional[threading.Thread] = None
 
+        # screen and stream from pyte (virtual terminal)
         self.screen = pyte.Screen(TERM_COLS, TERM_LINES)
         self.stream = pyte.Stream(self.screen)
 
-        self.message_id = None
+        self.console_message_id: Optional[int] = None  # the pinned console message (inline KB)
+        self.keyboard_message_id: Optional[int] = None  # message that set the reply keyboard
+
         self.last_render = ""
         self.last_sent = ""
+
+        self.edit_failures = 0
+        self._max_edit_failures = 3
 
     # ---------- CONNECT ----------
     def start(self, user, host, port, password):
@@ -108,13 +213,32 @@ class SSHSession:
             self.chan = self.client.invoke_shell()
             self.chan.settimeout(0)
 
+            # send initial console message with inline Close button
             msg = self.bot.send_message(
                 self.chat_id,
-                text="```Connecting...```",
+                text="```shell\nConnecting...\n```",
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=self.keyboard(),
+                reply_markup=INLINE_CLOSE_KB,
             )
-            self.message_id = msg.message_id
+            self.console_message_id = msg.message_id
+
+            try:
+                # Pin the console message if allowed
+                self.bot.pin_chat_message(chat_id=self.chat_id, message_id=self.console_message_id)
+            except Exception as e:
+                logger.debug("Could not pin message (permission or other issue): %s", e)
+
+            # send a separate (small) message to attach the reply keyboard for the user
+            try:
+                km = self.bot.send_message(
+                    self.chat_id,
+                    text="Control keyboard attached.",
+                    reply_markup=ReplyKeyboardMarkup(REPLY_KEYBOARD, resize_keyboard=True, one_time_keyboard=False),
+                )
+                self.keyboard_message_id = km.message_id
+            except Exception:
+                # non-fatal — continue without explicit keyboard if it fails
+                logger.debug("Failed to send reply keyboard message")
 
             self.thread = threading.Thread(target=self.loop, daemon=True)
             self.thread.start()
@@ -133,6 +257,7 @@ class SSHSession:
                     data = self.chan.recv(4096)
                     if not data:
                         break
+                    # feed terminal emulator
                     self.stream.feed(data.decode(errors="replace"))
 
                 now = time.time()
@@ -153,7 +278,34 @@ class SSHSession:
 
     # ---------- RENDER ----------
     def render_and_update(self):
-        text = "\n".join(self.screen.display).rstrip()
+        """
+        Render the pyte screen to text, but overlay a visible cursor at the
+        current cursor coordinates so the user can see where they are editing.
+        Keep the inline Close button attached to the console message.
+        """
+        # raw lines from pyte
+        raw_lines = list(self.screen.display)
+
+        # overlay cursor if possible
+        cursor_y = getattr(self.screen, "cursor").y
+        cursor_x = getattr(self.screen, "cursor").x
+
+        lines = []
+        for idx, ln in enumerate(raw_lines):
+            # ensure we have a mutable copy
+            sline = ln
+            if idx == cursor_y:
+                # pad if needed
+                if len(sline) <= cursor_x:
+                    sline = sline + " " * (cursor_x - len(sline) + 1)
+                # replace one character at cursor_x with CURSOR_CHAR
+                # build as list for safe replacement
+                lchars = list(sline)
+                lchars[cursor_x] = CURSOR_CHAR
+                sline = "".join(lchars)
+            lines.append(sline)
+
+        text = "\n".join(lines).rstrip()
 
         if text == self.last_render:
             return
@@ -164,63 +316,83 @@ class SSHSession:
         if safe == self.last_sent:
             return
 
+        payload = f"```shell\n{safe}\n```"
+
         try:
-            self.bot.edit_message_text(
-                chat_id=self.chat_id,
-                message_id=self.message_id,
-                text=f"```{safe}```",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=self.keyboard(),
-            )
-            self.last_sent = safe
+            # edit the existing console message and keep the Close glass button
+            if self.console_message_id:
+                self.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self.console_message_id,
+                    text=payload,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=INLINE_CLOSE_KB,
+                )
+                self.last_sent = safe
+                self.edit_failures = 0
+            else:
+                # no existing message - send one with only Close glass button
+                msg = self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=payload,
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=INLINE_CLOSE_KB,
+                )
+                self.console_message_id = msg.message_id
+                self.last_sent = safe
+
         except Exception as e:
             logger.warning("Edit failed: %s", e)
+            self.edit_failures += 1
+            # if we've failed multiple edits, send a fresh message and switch to it
+            if self.edit_failures >= self._max_edit_failures:
+                try:
+                    msg = self.bot.send_message(
+                        chat_id=self.chat_id,
+                        text=payload,
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=INLINE_CLOSE_KB,
+                    )
+                    self.console_message_id = msg.message_id
+                    self.last_sent = safe
+                    self.edit_failures = 0
+                except Exception as ee:
+                    logger.exception("Failed to send fallback message: %s", ee)
 
     # ---------- CLAMP ----------
     def clamp(self, text: str) -> str:
+        """Return the trailing part of `text` that fits within MAX_TG_CHARS."""
+        if len(text) <= MAX_TG_CHARS:
+            return text
+
         lines = text.splitlines()
-        out = []
+        out_lines: List[str] = []
+        total = 0
+        # iterate from the end and accumulate
         for line in reversed(lines):
-            out.insert(0, line)
-            if len("\n".join(out)) > MAX_TG_CHARS:
-                out.pop(0)
+            l = len(line) + (1 if out_lines else 0)  # account for newline if not the last
+            if total + l > MAX_TG_CHARS:
                 break
-        return "\n".join(out)
+            out_lines.append(line)
+            total += l
+
+        out_lines.reverse()
+        return "\n".join(out_lines)
 
     # ---------- INPUT ----------
     def send(self, text: str):
+        """
+        Send text to the remote channel. Text may contain control characters.
+        We send as-is (no automatic newline) but send it char-by-char so partial
+        typed messages behave like typing.
+        """
         try:
             if self.chan and not self.stop.is_set():
-                self.chan.send(text)
+                # send character-by-character to emulate typing & allow immediate processing
+                for ch in text:
+                    self.chan.send(ch)
         except Exception:
             logger.exception("Send failed")
-
-    # ---------- KEYBOARD (no mod toggles) ----------
-    def keyboard(self):
-        # removed CTRL/ALT/SHIFT buttons per request
-        return InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("TAB", callback_data="K:TAB"),
-                    InlineKeyboardButton("ENTER", callback_data="K:ENTER"),
-                    InlineKeyboardButton("ESC", callback_data="K:ESC"),
-                    InlineKeyboardButton("BS", callback_data="K:BS"),
-                ],
-                [
-                    InlineKeyboardButton("↑", callback_data="K:UP"),
-                    InlineKeyboardButton("↓", callback_data="K:DOWN"),
-                    InlineKeyboardButton("←", callback_data="K:LEFT"),
-                    InlineKeyboardButton("→", callback_data="K:RIGHT"),
-                ],
-                [
-                    InlineKeyboardButton("PGUP", callback_data="K:PGUP"),
-                    InlineKeyboardButton("PGDN", callback_data="K:PGDN"),
-                ],
-                [
-                    InlineKeyboardButton("EXIT NANO (Ctrl+X)", callback_data="K:NANO_EXIT"),
-                ],
-            ]
-        )
 
     # ---------- CLOSE ----------
     def close(self):
@@ -239,15 +411,26 @@ class SSHSession:
         except Exception:
             pass
 
+        # update the terminal message to show the session closed and remove user's keyboard
         try:
-            if self.message_id:
+            if self.console_message_id:
                 self.bot.edit_message_text(
                     chat_id=self.chat_id,
-                    message_id=self.message_id,
-                    text="```Session closed```",
+                    message_id=self.console_message_id,
+                    text="```shell\nSession closed\n```",
                     parse_mode=ParseMode.MARKDOWN,
                     reply_markup=None,
                 )
+                # attempt to unpin the message
+                try:
+                    self.bot.unpin_chat_message(chat_id=self.chat_id)
+                except Exception as e:
+                    logger.debug("Could not unpin message: %s", e)
+            # remove native reply keyboard by sending a small message
+            try:
+                self.bot.send_message(chat_id=self.chat_id, text="Keyboard removed.", reply_markup=ReplyKeyboardRemove())
+            except Exception:
+                pass
         except Exception as e:
             logger.debug("Could not update closed message: %s", e)
 
@@ -267,12 +450,6 @@ def stop_session(chat: int) -> bool:
 
 
 def parse_combo_tokens(tokens: List[str]) -> Tuple[List[str], str]:
-    """
-    tokens: a list of token strings, possibly containing '+' joined entries.
-    Returns (modifiers, key)
-    Modifiers are uppercased names "CTRL","ALT","SHIFT".
-    Key is lowercased single token (keeps case for special keys).
-    """
     merged: List[str] = []
     for t in tokens:
         # split by + as well
@@ -301,17 +478,6 @@ def parse_combo_tokens(tokens: List[str]) -> Tuple[List[str], str]:
 
 
 def build_sequence_from_mods_and_key(mods: List[str], key_token: str) -> str:
-    """
-    Build the byte sequence to send to the remote shell given modifiers and key token.
-    Handles:
-      - single character keys (letters/digits/symbols)
-      - special named keys from KEYS dict (ENTER, TAB, UP, etc.)
-    Rules:
-      - If ALT present -> prefix ESC (\x1b)
-      - If CTRL present and key is a single letter -> transform to control char (1-26)
-      - If SHIFT present and no CTRL -> uppercase single char
-      - If both ALT and CTRL -> prefix ESC then control char (common terminal behavior)
-    """
     if not key_token:
         return ""
 
@@ -358,65 +524,50 @@ def build_sequence_from_mods_and_key(mods: List[str], key_token: str) -> str:
             seq += ch0
         return seq
 
+def sha256_bytes(data: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(data)
+    return h.hexdigest()
+
+
+def compute_local_hash() -> str:
+    path = inspect.getsourcefile(lambda: None)
+    if not path:
+        return "UNKNOWN"
+    with open(path, "rb") as f:
+        return sha256_bytes(f.read())
+
+
+def compute_remote_hash(timeout: int = 10) -> str:
+    req = urllib.request.Request(
+        GITHUB_RAW_URL,
+        headers={"User-Agent": "SSHBot-Integrity-Check"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return sha256_bytes(r.read())
+
 
 # ================= HANDLERS =================
 def start_cmd(update: Update, ctx: CallbackContext):
-    chat = update.effective_chat.id
-    # short start message as requested, includes hyperlinked "source code" and plain "- by @EmptyPoll"
     text = (
-        "SSHBot — ready. / ربات SSH آماده است.\n\n"
+        "SSHBot / ربات SSH\n\n"
+        "Help / راهنما : /help\n"
+        "Hash-Check / بررسی هش ربات : /hash\n"
+        "\n"
         f"[source code]({REPO_URL}) - by @EmptyPoll"
     )
     update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
 def help_cmd(update: Update, ctx: CallbackContext):
-    chat = update.effective_chat.id
-    # Put all instructions here (detailed bilingual help)
     text = (
         "HELP — Commands / راهنما — دستورات\n\n"
-        "Core flow / نحوه استفاده اصلی:\n"
-        "1) `/ssh user@host[:port]` — prepare a connection (then send password).\n"
-        "   Example: `/ssh alice@example.com:22`\n"
-        "2) `/pass <password>` — send password. The bot will delete the password message for privacy.\n"
-        "   Example: `/pass mySecretPassword`\n"
-        "3) Terminal appears in a pinned message; type plain messages to send text input. Your typed message will be removed from chat by the bot for privacy.\n\n"
-        "Stopping / قطع سشن:\n"
-        "`/stop` — stop the current SSH session.\n"
-        "`/ssh` without arguments — also stops the current session.\n\n"
-        "Special buttons (still available under the terminal message): TAB, ENTER, ESC, BS, ↑ ↓ ← →, PGUP, PGDN, EXIT NANO (Ctrl+X).\n\n"
-        "Modifiers / ترکیب‌ها (no toggle buttons):\n"
-        "Use commands to send modifier combos. Commands delete themselves (privacy):\n"
-        " - `/ctrl <combo>` — send Ctrl combos. Examples:\n"
-        "     `/ctrl c` -> sends Ctrl+C\n"
-        "     `/ctrl alt c` -> sends Ctrl+Alt+C\n"
-        "     `/ctrl ctrl+alt+c` or `/ctrl ctrl alt c` -> also accepted\n\n"
-        " - `/alt <combo>` — send Alt combos. Examples:\n"
-        "     `/alt a` -> sends Alt+a (ESC + 'a')\n"
-        "     `/alt ctrl c` -> sends Alt+Ctrl+C\n\n"
-        " - `/shift <combo>` — send Shift combos. Example: `/shift a` -> sends 'A'\n\n"
-        " - `/keys <combo>` — flexible: `/keys ctrl+alt+c` or `/keys ctrl alt c` or `/keys alt+shift+x`.\n\n"
-        "Notes about combos:\n"
-        " - You may separate tokens by spaces or `+`.\n"
-        " - Modifiers supported: ctrl, alt, shift (case-insensitive).\n"
-        " - Examples:\n"
-        "     `/keys ctrl+alt+c`\n"
-        "     `/ctrl alt c`\n"
-        "     `/alt a`\n\n"
-        "Privacy & behavior / حریم خصوصی و رفتار بات:\n"
-        " - Password messages sent with `/pass` will be deleted by the bot when possible.\n"
-        " - Modifier/keys commands (`/ctrl`, `/alt`, `/shift`, `/keys`) attempt to delete the command message for privacy.\n"
-        " - Plain messages sent while a session is active are removed from chat and forwarded to the remote shell.\n\n"
-        "Troubleshooting / رفع مشکل:\n"
-        " - If a session already exists and you call `/ssh user@host`, the bot will stop the previous session first.\n"
-        " - If connection fails, an error message is returned and no session is kept.\n\n"
-        "Examples / مثال‌ها:\n"
-        "`/ssh ali@1.2.3.4`\n"
-        "`/pass mypassword` (deleted)\n"
-        "`/ctrl c`  -> Ctrl+C\n"
-        "`/alt a`   -> Alt+a\n"
-        "`/keys ctrl+alt+c` -> Ctrl+Alt+C\n\n"
-        "That's all — contact the bot owner if you need custom changes. / همین— برای تغییرات بیشتر با صاحب بات تماس بگیرید."
+        "Core flow:\n"
+        "1) `/hash — compare the hash of the running bot with the source code for backdoor safety.\n"
+        "2) `/ssh user@host[:port]` — prepare a connection (then send password).\n"
+        "3) `/pass <password>` — send password (deleted by bot when possible).\n"
+        "4) Type to edit input (no automatic newline). Use ENTER button to submit newline.\n\n"
+        "Buttons: TAB, ENTER, ESC, BS (Backspace), arrows, PGUP, PGDN, Insert, Delete, Home, End, Shift+Tab, F1..F12.\n"
     )
     update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -444,7 +595,8 @@ def ssh_cmd(update: Update, ctx: CallbackContext):
         return
 
     user, host, port = m.group(1), m.group(2), int(m.group(3) or 22)
-    PENDING[chat] = (user, host, port)
+    # store timestamp so we can expire stale pending requests if desired
+    PENDING[chat] = (user, host, port, time.time())
     update.message.reply_text(
         "Send password using /pass <password> (message will be deleted). / برای ارسال رمز از /pass استفاده کنید (پیام حذف خواهد شد)."
     )
@@ -461,7 +613,7 @@ def pass_cmd(update: Update, ctx: CallbackContext):
         return
 
     pwd = " ".join(ctx.args)
-    user, host, port = PENDING.pop(chat)
+    user, host, port, _ts = PENDING.pop(chat)
 
     # delete the message that contained the password if possible
     try:
@@ -475,11 +627,19 @@ def pass_cmd(update: Update, ctx: CallbackContext):
     sess = SSHSession(chat, ctx.bot)
     SESSIONS[chat] = sess
     ok, err = sess.start(user, host, port, pwd)
+
+    # zero the password variable as soon as possible
+    try:
+        pwd = None
+        del pwd
+    except Exception:
+        pass
+
     if not ok:
         SESSIONS.pop(chat, None)
         update.message.reply_text(f"Connection failed: {err} / اتصال ناموفق: {err}")
     else:
-        update.message.reply_text("Connected. Terminal is shown in the pinned message above. / متصل شد.")
+        logger.info("Session started for chat %s", chat)
 
 
 def stop_cmd(update: Update, ctx: CallbackContext):
@@ -488,10 +648,17 @@ def stop_cmd(update: Update, ctx: CallbackContext):
     if s_existed:
         update.message.reply_text("Stopped SSH session. / سشن قطع شد.")
     else:
-        update.message.reply_text("No active SSH session found. / سشن فعالی یافت نشد.")
+        update.message.reply_text("No active SSH session found. / سشن فعادی یافت نشد.")
 
 
 def text_msg(update: Update, ctx: CallbackContext):
+    """
+    Handles plain text messages from the user:
+     - Delete the message in chat for privacy.
+     - If the message matches one of the reply keyboard labels, send the
+       corresponding control sequence.
+     - Otherwise, forward content character-by-character (no automatic newline).
+    """
     chat = update.effective_chat.id
     s = SESSIONS.get(chat)
     if not s:
@@ -504,8 +671,15 @@ def text_msg(update: Update, ctx: CallbackContext):
         pass
 
     text = update.message.text or ""
-    # send the typed text to the session (append newline)
-    s.send(text + "\n")
+
+    # if user pressed a keyboard button, translate to sequence
+    seq = LABEL_TO_SEQ.get(text)
+    if seq is not None:
+        s.send(seq)
+        return
+
+    # otherwise, send typed characters as-is (no newline appended)
+    s.send(text)
 
 
 def cb(update: Update, ctx: CallbackContext):
@@ -515,16 +689,28 @@ def cb(update: Update, ctx: CallbackContext):
 
     chat = q.message.chat_id
     s = SESSIONS.get(chat)
-    if not s:
+    data = q.data or ""
+
+    # Close connection button
+    if data == "C:CLOSE":
         try:
-            q.answer("No active session. / سشن فعال نیست.")
-            ctx.bot.edit_message_reply_markup(chat_id=chat, message_id=q.message.message_id, reply_markup=None)
+            q.answer("Closing connection...")
         except Exception:
             pass
+        # trigger stop (this will edit the console message and remove keyboard)
+        stop_session(chat)
         return
 
-    if q.data.startswith("K:"):
-        key = q.data[2:]
+    # Key callbacks are not present on glass anymore; if ever received, handle K:*
+    if data.startswith("K:"):
+        key = data[2:]
+        if not s:
+            try:
+                q.answer("No active session. / سشن فعال نیست.")
+            except Exception:
+                pass
+            return
+
         val = KEYS.get(key)
         if val is not None:
             s.send(val)
@@ -532,23 +718,44 @@ def cb(update: Update, ctx: CallbackContext):
             q.answer()
         except Exception:
             pass
-    else:
-        try:
-            q.answer()
-        except Exception:
-            pass
+        return
+
+    try:
+        q.answer()
+    except Exception:
+        pass
+
+def hash_cmd(update: Update, ctx: CallbackContext):
+    try:
+        local_hash = compute_local_hash()
+        remote_hash = compute_remote_hash()
+
+        if local_hash == remote_hash:
+            update.message.reply_text(
+                "✅ *Integrity verified*\n"
+                "Running code matches GitHub exactly.\n\n"
+                f"`{local_hash}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            update.message.reply_text(
+                "❌ *Integrity check FAILED*\n"
+                "This bot is MODIFIED.\n\n"
+                f"*Local:*\n`{local_hash}`\n\n"
+                f"*GitHub:*\n`{remote_hash}`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+    except Exception as e:
+        update.message.reply_text(
+            "⚠️ *Integrity check error*\n"
+            f"Could not reach GitHub.\n\n`{e}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
 
 
 # ---------- modifier commands as per-request ----------
 def process_modifier_command(primary_mod: str, update: Update, ctx: CallbackContext):
-    """
-    primary_mod: one of "CTRL", "ALT", "SHIFT" depending on command used.
-    ctx.args may contain additional modifiers and the key to send.
-    Examples user inputs:
-      /ctrl c
-      /ctrl alt c
-      /ctrl ctrl+alt+c
-    """
     chat = update.effective_chat.id
     s = SESSIONS.get(chat)
     # try to delete the command message for privacy
@@ -567,16 +774,10 @@ def process_modifier_command(primary_mod: str, update: Update, ctx: CallbackCont
     mods, key = parse_combo_tokens(merged_tokens)
     seq = build_sequence_from_mods_and_key(mods, key)
     if not seq:
-        update.message.reply_text("Could not parse key. Usage: /ctrl c   or /ctrl alt c   or /keys ctrl+alt+c\n/ نتوانست کلید را پردازش کند.")
+        update.message.reply_text("Could not parse key. Usage: /ctrl c   or /keys ctrl+alt+c")
         return
 
     s.send(seq)
-    # Optionally update keyboard UI to same terminal text (no toggles)
-    try:
-        if s.message_id:
-            ctx.bot.edit_message_reply_markup(chat_id=chat, message_id=s.message_id, reply_markup=s.keyboard())
-    except Exception:
-        pass
 
 
 def ctrl_cmd(update: Update, ctx: CallbackContext):
@@ -592,12 +793,6 @@ def shift_cmd(update: Update, ctx: CallbackContext):
 
 
 def keys_cmd(update: Update, ctx: CallbackContext):
-    """
-    Generic /keys command where user may send full combo:
-      /keys ctrl+alt+c
-      /keys ctrl alt c
-      /keys alt+shift+X
-    """
     chat = update.effective_chat.id
     s = SESSIONS.get(chat)
     # delete command message for privacy
@@ -612,7 +807,7 @@ def keys_cmd(update: Update, ctx: CallbackContext):
 
     tokens = ctx.args or []
     if not tokens:
-        update.message.reply_text("Usage: /keys ctrl+alt+c or /keys ctrl alt c\n/ نحوه استفاده: /keys ctrl+alt+c")
+        update.message.reply_text("Usage: /keys ctrl+alt+c or /keys ctrl alt c")
         return
 
     mods, key = parse_combo_tokens(tokens)
@@ -622,11 +817,6 @@ def keys_cmd(update: Update, ctx: CallbackContext):
         return
 
     s.send(seq)
-    try:
-        if s.message_id:
-            ctx.bot.edit_message_reply_markup(chat_id=chat, message_id=s.message_id, reply_markup=s.keyboard())
-    except Exception:
-        pass
 
 
 # ================= MAIN =================
@@ -640,6 +830,7 @@ def main():
 
     dp.add_handler(CommandHandler("start", start_cmd))
     dp.add_handler(CommandHandler("help", help_cmd))
+    dp.add_handler(CommandHandler("hash", hash_cmd))
     dp.add_handler(CommandHandler("ssh", ssh_cmd))
     dp.add_handler(CommandHandler("pass", pass_cmd))
     dp.add_handler(CommandHandler("stop", stop_cmd))
