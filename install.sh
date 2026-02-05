@@ -65,13 +65,12 @@ ok "Package manager detected: $PM"
 msg "Installing system dependencies"
 
 if [[ "$PM" == "apt" ]]; then
-    export DEBIAN_FRONTEND=noninteractive
-    export NEEDRESTART_MODE=a
-    apt update -y >/dev/null
-    apt install -y --no-install-recommends python3 python3-venv python3-pip openssh-client curl >/dev/null
+  export DEBIAN_FRONTEND=noninteractive
+  apt update -y >/dev/null
+  apt install -y python3 python3-venv python3-pip openssh-client curl >/dev/null
 else
-    $PM install -y epel-release >/dev/null || true
-    $PM install -y python3 python3-pip python3-virtualenv openssh-clients curl >/dev/null
+  $PM install -y epel-release >/dev/null || true
+  $PM install -y python3 python3-pip python3-virtualenv openssh-clients curl >/dev/null
 fi
 
 ok "System packages installed"
