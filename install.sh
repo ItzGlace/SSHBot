@@ -1,7 +1,7 @@
-
 #!/usr/bin/env bash
+set -e
 
-# ================= COLORS =================
+# ================= UI =================
 RED="\e[31m"
 GREEN="\e[32m"
 YELLOW="\e[33m"
@@ -10,57 +10,84 @@ CYAN="\e[36m"
 BOLD="\e[1m"
 RESET="\e[0m"
 
-# ================= CHECK ROOT =================
-if [[ $EUID -ne 0 ]]; then
-  echo -e "${RED}${BOLD}❌ Please run this script as root${RESET}"
-  exit 1
-fi
+line() { echo -e "${CYAN}${BOLD}=========================================${RESET}"; }
+msg()  { echo -e "${BLUE}➜${RESET} $1"; }
+ok()   { echo -e "${GREEN}✔${RESET} $1"; }
+err()  { echo -e "${RED}✖${RESET} $1"; exit 1; }
+
+# ================= ROOT CHECK =================
+[[ $EUID -ne 0 ]] && err "Please run this script as root"
 
 clear
-echo -e "${CYAN}${BOLD}"
-echo "========================================="
-echo "        SSHBot Installer"
-echo "========================================="
-echo -e "${RESET}"
+line
+echo -e "${BOLD}        🚀 SSHBot Universal Installer${RESET}"
+line
+echo
 
-# ================= ASK BOT TOKEN =================
-read -rp "$(echo -e ${YELLOW}'🤖 Enter your Telegram Bot Token: '${RESET})" BOT_TOKEN
-
-if [[ -z "$BOT_TOKEN" ]]; then
-  echo -e "${RED}❌ Bot token cannot be empty${RESET}"
-  exit 1
-fi
+# ================= BOT TOKEN =================
+read -rp "$(echo -e ${YELLOW}'🤖 Enter Telegram Bot Token: '${RESET})" BOT_TOKEN
+[[ -z "$BOT_TOKEN" ]] && err "Bot token cannot be empty"
 
 # ================= PATHS =================
 INSTALL_DIR="/opt/sshbot"
 BOT_FILE="$INSTALL_DIR/ssh-bot.py"
+VENV_DIR="$INSTALL_DIR/venv"
 SERVICE_FILE="/etc/systemd/system/sshbot.service"
 
-# ================= INSTALL DEPS =================
-echo -e "${BLUE}📦 Installing dependencies...${RESET}"
-apt update -y >/dev/null 2>&1
-apt install -y python3 python3-pip openssh-client >/dev/null 2>&1
+# ================= OS / PACKAGE MANAGER =================
+msg "Detecting Linux distribution"
 
-pip3 install --upgrade pip >/dev/null 2>&1
-pip3 install python-telegram-bot==13.15 paramiko pyte >/dev/null 2>&1
+if command -v apt >/dev/null 2>&1; then
+  PM="apt"
+elif command -v dnf >/dev/null 2>&1; then
+  PM="dnf"
+elif command -v yum >/dev/null 2>&1; then
+  PM="yum"
+else
+  err "Unsupported distro: no apt / dnf / yum found"
+fi
+
+ok "Package manager detected: $PM"
+
+# ================= INSTALL DEPS =================
+msg "Installing system dependencies"
+
+if [[ "$PM" == "apt" ]]; then
+  apt update -y >/dev/null
+  apt install -y python3 python3-venv python3-pip openssh-client curl >/dev/null
+else
+  $PM install -y epel-release >/dev/null || true
+  $PM install -y python3 python3-pip python3-virtualenv openssh-clients curl >/dev/null
+fi
+
+ok "System packages installed"
 
 # ================= DOWNLOAD BOT =================
-echo -e "${BLUE}⬇️  Downloading SSHBot...${RESET}"
+msg "Downloading SSHBot"
+
 mkdir -p "$INSTALL_DIR"
 
 curl -fsSL \
   https://github.com/ItzGlace/SSHBot/raw/refs/heads/main/ssh-bot.py \
-  -o "$BOT_FILE"
-
-if [[ ! -f "$BOT_FILE" ]]; then
-  echo -e "${RED}❌ Failed to download bot file${RESET}"
-  exit 1
-fi
+  -o "$BOT_FILE" || err "Failed to download bot file"
 
 chmod +x "$BOT_FILE"
+ok "Bot downloaded"
 
-# ================= CREATE SERVICE =================
-echo -e "${BLUE}⚙️  Creating systemd service...${RESET}"
+# ================= PYTHON VENV =================
+msg "Creating Python virtual environment"
+
+python3 -m venv "$VENV_DIR"
+
+source "$VENV_DIR/bin/activate"
+pip install --upgrade pip >/dev/null
+pip install python-telegram-bot==13.15 paramiko pyte >/dev/null
+deactivate
+
+ok "Virtual environment ready"
+
+# ================= SYSTEMD SERVICE =================
+msg "Creating systemd service"
 
 cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -72,7 +99,7 @@ Type=simple
 User=root
 WorkingDirectory=$INSTALL_DIR
 Environment=BOT_TOKEN=$BOT_TOKEN
-ExecStart=/usr/bin/python3 $BOT_FILE
+ExecStart=$VENV_DIR/bin/python $BOT_FILE
 Restart=always
 RestartSec=5
 
@@ -80,28 +107,32 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
+ok "Service created"
+
 # ================= START SERVICE =================
-echo -e "${BLUE}🚀 Starting bot service...${RESET}"
+msg "Starting SSHBot service"
+
 systemctl daemon-reexec
 systemctl daemon-reload
-systemctl enable sshbot >/dev/null 2>&1
+systemctl enable sshbot >/dev/null
 systemctl restart sshbot
 
 sleep 1
 
 # ================= STATUS =================
 if systemctl is-active --quiet sshbot; then
+  echo
+  line
   echo -e "${GREEN}${BOLD}✅ SSHBot installed and running!${RESET}"
+  line
 else
-  echo -e "${RED}${BOLD}❌ SSHBot failed to start${RESET}"
-  echo -e "${YELLOW}Check logs with:${RESET} journalctl -u sshbot -f"
-  exit 1
+  err "SSHBot failed to start — check logs: journalctl -u sshbot -f"
 fi
 
-# ================= DONE =================
+# ================= HELP =================
 echo
-echo -e "${CYAN}📌 Commands:${RESET}"
+echo -e "${CYAN}📌 Useful commands:${RESET}"
 echo -e "  ${BOLD}systemctl status sshbot${RESET}"
 echo -e "  ${BOLD}journalctl -u sshbot -f${RESET}"
 echo
-echo -e "${GREEN}🎉 Done! Enjoy your SSH Telegram bot.${RESET}"
+echo -e "${GREEN}🎉 Installation complete on $(cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"')${RESET}"
