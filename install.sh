@@ -137,7 +137,7 @@ systemctl daemon-reload
 systemctl enable sshbot >/dev/null
 systemctl restart sshbot
 
-sleep 1
+sleep 2
 
 # ================= STATUS =================
 if systemctl is-active --quiet sshbot; then
@@ -148,6 +148,17 @@ if systemctl is-active --quiet sshbot; then
   line
 else
   err "SSHBot failed to start — check logs: journalctl -u sshbot -f"
+fi
+
+# ================= BOT URL =================
+msg "Fetching bot username from Telegram..."
+
+BOT_USERNAME=$(curl -s "https://api.telegram.org/bot$BOT_TOKEN/getMe" | grep -Po '"username":"\K[^"]+')
+
+if [[ -n "$BOT_USERNAME" ]]; then
+  echo -e "${GREEN}🔗 Your bot URL: ${RESET}https://t.me/$BOT_USERNAME"
+else
+  warn "Failed to fetch bot username. You can use your token to find it manually."
 fi
 
 # ================= HELP =================
